@@ -24,13 +24,16 @@ import errno
 import logging
 import os
 import pathlib
+import subprocess
 import sys
+from contextlib import contextmanager
 from typing import TYPE_CHECKING, List, Set, Type
 
 from rich.markdown import Markdown
 
 from ansiblelint import cli, formatters
 from ansiblelint.color import console, console_stderr
+from ansiblelint.file_utils import cwd
 from ansiblelint.generate_docs import rules_as_rich, rules_as_rst
 from ansiblelint.rules import RulesCollection
 from ansiblelint.runner import Runner
@@ -151,6 +154,45 @@ def main() -> int:
         skip.update(str(s).split(','))
     options.skip_list = frozenset(skip)
 
+    matches = _get_matches(rules, options)
+
+    # Assure we do not print duplicates and the order is consistent
+    matches = sorted(set(matches))
+
+    mark_as_success = False
+    if matches and options.progressive:
+        _logger.info(
+            "Matches found, running again on previos revision in order to detect regressions")
+        with _previous_revision():
+            old_matches = _get_matches(rules, options)
+            # remove old matches from current list
+            if len(old_matches) > len(matches):
+                _logger.warning(
+                    "Total violation(s) reducted from %s to %s since previous "
+                    "commit, will mark result as success",
+                    len(old_matches), len(matches))
+                mark_as_success = True
+            current_len = len(matches)
+            matches = list(set(matches) - set(old_matches))
+            _logger.warning("Removed %s previously known violation(s)", current_len - len(matches))
+
+    for match in matches:
+        print(formatter.format(match, options.colored))
+
+    # If run under GitHub Actions we also want to emit output recognized by it.
+    if os.getenv('GITHUB_ACTIONS') == 'true' and os.getenv('GITHUB_WORKFLOW'):
+        formatter = formatters.AnnotationsFormatter(cwd, True)
+        for match in matches:
+            print(formatter.format(match))
+
+    if matches and not mark_as_success:
+        return report_outcome(matches, options=options)
+    else:
+        return 0
+
+
+def _get_matches(rules: RulesCollection, options: "Namespace") -> list:
+
     if not options.playbook:
         # no args triggers auto-detection mode
         playbooks = get_playbooks_and_roles(options=options)
@@ -164,23 +206,23 @@ def main() -> int:
                         options.skip_list, options.exclude_paths,
                         options.verbosity, checked_files)
         matches.extend(runner.run())
+    return matches
 
-    # Assure we do not print duplicates and the order is consistent
-    matches = sorted(set(matches))
 
-    for match in matches:
-        print(formatter.format(match, options.colored))
-
-    # If run under GitHub Actions we also want to emit output recognized by it.
-    if os.getenv('GITHUB_ACTIONS') == 'true' and os.getenv('GITHUB_WORKFLOW'):
-        formatter = formatters.AnnotationsFormatter(cwd, True)
-        for match in matches:
-            print(formatter.format(match))
-
-    if matches:
-        return report_outcome(matches, options=options)
-    else:
-        return 0
+@contextmanager
+def _previous_revision():
+    """Create or updates a temporary workdir containing the previous revious."""
+    worktree_dir = ".cache/old-rev"
+    revision = subprocess.run(
+        ["git", "rev-parse", "HEAD^1"],
+        check=True,
+        universal_newlines=True).stdout
+    p = pathlib.Path(worktree_dir)
+    p.mkdir(parents=True, exist_ok=True)
+    os.system(f"git worktree add -f {worktree_dir}")
+    with cwd(worktree_dir):
+        os.system(f"git checkout {revision}")
+        yield
 
 
 if __name__ == "__main__":
